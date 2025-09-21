@@ -1,0 +1,1309 @@
+https://vscode-f670bc08-b203-4891-bd18-017a11ad6f03.preview.emergentagent.com/
+...
+https://vscode-f670bc08-b203-4891-bd18-017a11ad6f03.preview.emergentagent.com/
+Now let me show you the key code files:
+Action: view_bulk --path-list /app/backend/server.py,/app/frontend/src/App.js,/app/frontend/src/App.css,/app/backend/.env,/app/frontend/.env,/app/backend/requirements.txt,/app/frontend/package.json
+Observation: /app/backend/server.py:
+1|from fastapi import FastAPI, APIRouter, HTTPException, Depends
+2|from dotenv import load_dotenv
+3|from starlette.middleware.cors import CORSMiddleware
+4|from motor.motor_asyncio import AsyncIOMotorClient
+5|import os
+6|import logging
+7|from pathlib import Path
+8|from pydantic import BaseModel, Field
+9|from typing import List, Optional, Dict, Any
+10|import uuid
+11|from datetime import datetime, timezone, timedelta
+12|from emergentintegrations.llm.chat import LlmChat, UserMessage
+13|import asyncio
+14|import random
+15|import json
+16|
+17|ROOT_DIR = Path(__file__).parent
+18|load_dotenv(ROOT_DIR / '.env')
+19|
+20|# MongoDB connection
+21|mongo_url = os.environ['MONGO_URL']
+22|client = AsyncIOMotorClient(mongo_url)
+23|db = client[os.environ['DB_NAME']]
+24|
+25|# Create the main app without a prefix
+26|app = FastAPI()
+27|
+28|# Create a router with the /api prefix
+29|api_router = APIRouter(prefix="/api")
+30|
+31|# Models
+32|class User(BaseModel):
+33|    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+34|    email: str
+35|    name: str
+36|    user_type: str  # household, restaurant, mess
+37|    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+38|
+39|class UserCreate(BaseModel):
+40|    email: str
+41|    name: str
+42|    user_type: str
+43|
+44|class Device(BaseModel):
+45|    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+46|    user_id: str
+47|    name: str
+48|    location: str
+49|    status: str = "active"  # active, maintenance, offline
+50|    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+51|
+52|class DeviceCreate(BaseModel):
+53|    user_id: str
+54|    name: str
+55|    location: str
+56|
+57|class SensorReading(BaseModel):
+58|    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+59|    device_id: str
+60|    food_weight: float  # kg
+61|    energy_generated: float  # Wh
+62|    battery_level: float  # percentage
+63|    conversion_efficiency: float  # percentage
+64|    temperature: float  # celsius
+65|    ph_level: float
+66|    gas_levels: Dict[str, float]  # methane, co2, etc
+67|    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+68|
+69|class SensorReadingCreate(BaseModel):
+70|    device_id: str
+71|    food_weight: float
+72|    energy_generated: float
+73|    battery_level: float
+74|    conversion_efficiency: float
+75|    temperature: float
+76|    ph_level: float
+77|    gas_levels: Dict[str, float]
+78|
+79|class AIInsight(BaseModel):
+80|    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+81|    user_id: str
+82|    insight_type: str  # pattern, suggestion, alert
+83|    title: str
+84|    content: str
+85|    priority: str = "medium"  # low, medium, high
+86|    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+87|
+88|class Achievement(BaseModel):
+89|    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+90|    user_id: str
+91|    title: str
+92|    description: str
+93|    points: int
+94|    icon: str
+95|    unlocked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+96|
+97|# Initialize AI chat
+98|def get_ai_chat():
+99|    return LlmChat(
+100|        api_key=os.environ.get('EMERGENT_LLM_KEY'),
+101|        session_id="trash_battery_ai",
+102|        system_message="You are an AI assistant for a food waste-to-energy conversion system. Provide insights about waste patterns, energy optimization, and environmental impact. Keep responses concise and actionable."
+103|    ).with_model("anthropic", "claude-3-5-sonnet-20241022")
+104|
+105|# Helper functions
+106|def generate_mock_sensor_data(device_id: str) -> SensorReadingCreate:
+107|    """Generate realistic mock sensor data"""
+108|    base_food_weight = random.uniform(0.5, 3.0)  # kg
+109|    base_energy = base_food_weight * random.uniform(2, 5)  # Wh per kg
+110|    
+111|    return SensorReadingCreate(
+112|        device_id=device_id,
+113|        food_weight=base_food_weight,
+114|        energy_generated=base_energy,
+115|        battery_level=random.uniform(20, 100),
+116|        conversion_efficiency=random.uniform(75, 95),
+117|        temperature=random.uniform(25, 40),
+118|        ph_level=random.uniform(6.5, 7.5),
+119|        gas_levels={
+120|            "methane": random.uniform(0, 10),
+121|            "co2": random.uniform(300, 500),
+122|            "hydrogen_sulfide": random.uniform(0, 5)
+123|        }
+124|    )
+125|
+126|def calculate_environmental_impact(energy_generated: float) -> Dict[str, float]:
+127|    """Calculate CO2 saved and other environmental benefits"""
+128|    # Rough calculations: 1 Wh = ~0.5g CO2 saved from grid electricity
+129|    co2_saved = energy_generated * 0.0005  # kg CO2
+130|    trees_equivalent = co2_saved / 21.8  # kg CO2 per tree per year / 365
+131|    
+132|    return {
+133|        "co2_saved_kg": round(co2_saved, 3),
+134|        "trees_equivalent_days": round(trees_equivalent, 2),
+135|        "grid_energy_offset_wh": energy_generated
+136|    }
+137|
+138|async def generate_ai_insights(user_id: str, recent_data: List[SensorReading]) -> List[AIInsight]:
+139|    """Generate AI insights based on user data"""
+140|    if not recent_data:
+141|        return []
+142|    
+143|    # Prepare data summary for AI
+144|    total_energy = sum(reading.energy_generated for reading in recent_data)
+145|    avg_efficiency = sum(reading.conversion_efficiency for reading in recent_data) / len(recent_data)
+146|    total_waste = sum(reading.food_weight for reading in recent_data)
+147|    
+148|    data_summary = f"""
+149|    Recent data (last {len(recent_data)} readings):
+150|    - Total energy generated: {total_energy:.2f} Wh
+151|    - Average conversion efficiency: {avg_efficiency:.1f}%
+152|    - Total food waste processed: {total_waste:.2f} kg
+153|    - Readings span: {len(recent_data)} data points
+154|    """
+155|    
+156|    try:
+157|        chat = get_ai_chat()
+158|        user_message = UserMessage(
+159|            text=f"Analyze this food waste-to-energy data and provide 2-3 actionable insights: {data_summary}"
+160|        )
+161|        
+162|        response = await chat.send_message(user_message)
+163|        
+164|        # Parse AI response into structured insights
+165|        insights = []
+166|        insight_lines = response.split('\n')
+167|        
+168|        for i, line in enumerate(insight_lines[:3]):  # Max 3 insights
+169|            if line.strip() and len(line.strip()) > 10:
+170|                insights.append(AIInsight(
+171|                    user_id=user_id,
+172|                    insight_type="suggestion",
+173|                    title=f"AI Insight #{i+1}",
+174|                    content=line.strip(),
+175|                    priority="medium"
+176|                ))
+177|        
+178|        return insights
+179|    except Exception as e:
+180|        logging.error(f"AI insight generation failed: {e}")
+181|        # Return fallback insights
+182|        return [
+183|            AIInsight(
+184|                user_id=user_id,
+185|                insight_type="suggestion",
+186|                title="Efficiency Tip",
+187|                content=f"Your average conversion efficiency is {avg_efficiency:.1f}%. Consider adding more organic matter for better results.",
+188|                priority="medium"
+189|            )
+190|        ]
+191|
+192|# API Routes
+193|@api_router.post("/users", response_model=User)
+194|async def create_user(user: UserCreate):
+195|    user_obj = User(**user.dict())
+196|    await db.users.insert_one(user_obj.dict())
+197|    return user_obj
+198|
+199|@api_router.get("/users/{user_id}", response_model=User)
+200|async def get_user(user_id: str):
+201|    user = await db.users.find_one({"id": user_id})
+202|    if not user:
+203|        raise HTTPException(status_code=404, detail="User not found")
+204|    return User(**user)
+205|
+206|@api_router.post("/devices", response_model=Device)
+207|async def create_device(device: DeviceCreate):
+208|    device_obj = Device(**device.dict())
+209|    await db.devices.insert_one(device_obj.dict())
+210|    return device_obj
+211|
+212|@api_router.get("/users/{user_id}/devices", response_model=List[Device])
+213|async def get_user_devices(user_id: str):
+214|    devices = await db.devices.find({"user_id": user_id}).to_list(1000)
+215|    return [Device(**device) for device in devices]
+216|
+217|@api_router.post("/sensor-data", response_model=SensorReading)
+218|async def create_sensor_reading(reading: SensorReadingCreate):
+219|    reading_obj = SensorReading(**reading.dict())
+220|    await db.sensor_readings.insert_one(reading_obj.dict())
+221|    return reading_obj
+222|
+223|@api_router.get("/devices/{device_id}/sensor-data", response_model=List[SensorReading])
+224|async def get_device_sensor_data(device_id: str, limit: int = 50):
+225|    readings = await db.sensor_readings.find({"device_id": device_id}).sort("timestamp", -1).limit(limit).to_list(limit)
+226|    return [SensorReading(**reading) for reading in readings]
+227|
+228|@api_router.post("/devices/{device_id}/mock-data")
+229|async def generate_mock_data(device_id: str, count: int = 10):
+230|    """Generate mock sensor data for testing"""
+231|    readings = []
+232|    for i in range(count):
+233|        mock_data = generate_mock_sensor_data(device_id)
+234|        # Vary timestamps for realistic data
+235|        mock_reading = SensorReading(
+236|            **mock_data.dict(),
+237|            timestamp=datetime.now(timezone.utc) - timedelta(hours=i)
+238|        )
+239|        await db.sensor_readings.insert_one(mock_reading.dict())
+240|        readings.append(mock_reading)
+241|    
+242|    return {"message": f"Generated {count} mock readings", "readings": readings}
+243|
+244|@api_router.get("/users/{user_id}/dashboard")
+245|async def get_dashboard_data(user_id: str):
+246|    """Get comprehensive dashboard data"""
+247|    # Get user devices
+248|    devices = await db.devices.find({"user_id": user_id}).to_list(1000)
+249|    
+250|    if not devices:
+251|        return {"message": "No devices found", "data": {}}
+252|    
+253|    device_ids = [device["id"] for device in devices]
+254|    
+255|    # Get recent sensor data (last 24 hours)
+256|    recent_time = datetime.now(timezone.utc) - timedelta(hours=24)
+257|    recent_readings = await db.sensor_readings.find({
+258|        "device_id": {"$in": device_ids},
+259|        "timestamp": {"$gte": recent_time}
+260|    }).to_list(1000)
+261|    
+262|    if not recent_readings:
+263|        return {"message": "No recent data", "data": {}}
+264|    
+265|    # Calculate totals
+266|    total_energy = sum(reading["energy_generated"] for reading in recent_readings)
+267|    total_waste = sum(reading["food_weight"] for reading in recent_readings)
+268|    avg_efficiency = sum(reading["conversion_efficiency"] for reading in recent_readings) / len(recent_readings)
+269|    
+270|    # Environmental impact
+271|    impact = calculate_environmental_impact(total_energy)
+272|    
+273|    # Get user info for personalization
+274|    user = await db.users.find_one({"id": user_id})
+275|    user_type = user["user_type"] if user else "household"
+276|    
+277|    # Generate AI insights
+278|    sensor_readings = [SensorReading(**reading) for reading in recent_readings]
+279|    insights = await generate_ai_insights(user_id, sensor_readings[-10:])  # Last 10 readings
+280|    
+281|    # Save insights to database
+282|    for insight in insights:
+283|        await db.ai_insights.insert_one(insight.dict())
+284|    
+285|    # Check for achievements
+286|    achievements = await check_achievements(user_id, total_energy, total_waste)
+287|    
+288|    return {
+289|        "user_type": user_type,
+290|        "summary": {
+291|            "total_energy_generated": round(total_energy, 2),
+292|            "total_food_waste": round(total_waste, 2),
+293|            "average_efficiency": round(avg_efficiency, 1),
+294|            "active_devices": len(devices),
+295|            "readings_count": len(recent_readings)
+296|        },
+297|        "environmental_impact": impact,
+298|        "recent_readings": sensor_readings[-20:],  # Last 20 readings
+299|        "ai_insights": insights,
+300|        "achievements": achievements,
+301|        "devices": [Device(**device) for device in devices]
+302|    }
+303|
+304|async def check_achievements(user_id: str, total_energy: float, total_waste: float) -> List[Achievement]:
+305|    """Check and award achievements"""
+306|    achievements = []
+307|    
+308|    # Check existing achievements
+309|    existing = await db.achievements.find({"user_id": user_id}).to_list(1000)
+310|    existing_titles = {ach["title"] for ach in existing}
+311|    
+312|    # Energy milestones
+313|    if total_energy >= 100 and "Energy Pioneer" not in existing_titles:
+314|        achievements.append(Achievement(
+315|            user_id=user_id,
+316|            title="Energy Pioneer",
+317|            description="Generated your first 100Wh from food waste!",
+318|            points=100,
+319|            icon="⚡"
+320|        ))
+321|    
+322|    if total_energy >= 1000 and "Power Producer" not in existing_titles:
+323|        achievements.append(Achievement(
+324|            user_id=user_id,
+325|            title="Power Producer",
+326|            description="Generated 1000Wh - enough to charge a phone 50 times!",
+327|            points=500,
+328|            icon="🔋"
+329|        ))
+330|    
+331|    # Waste processing milestones
+332|    if total_waste >= 10 and "Waste Warrior" not in existing_titles:
+333|        achievements.append(Achievement(
+334|            user_id=user_id,
+335|            title="Waste Warrior",
+336|            description="Processed 10kg of food waste into clean energy!",
+337|            points=200,
+338|            icon="🌱"
+339|        ))
+340|    
+341|    # Save new achievements
+342|    for achievement in achievements:
+343|        await db.achievements.insert_one(achievement.dict())
+344|    
+345|    return achievements
+346|
+347|@api_router.get("/users/{user_id}/insights", response_model=List[AIInsight])
+348|async def get_user_insights(user_id: str, limit: int = 10):
+349|    insights = await db.ai_insights.find({"user_id": user_id}).sort("created_at", -1).limit(limit).to_list(limit)
+350|    return [AIInsight(**insight) for insight in insights]
+351|
+352|@api_router.get("/users/{user_id}/achievements", response_model=List[Achievement])
+353|async def get_user_achievements(user_id: str):
+354|    achievements = await db.achievements.find({"user_id": user_id}).sort("unlocked_at", -1).to_list(1000)
+355|    return [Achievement(**achievement) for achievement in achievements]
+356|
+357|# Include the router in the main app
+358|app.include_router(api_router)
+359|
+360|app.add_middleware(
+361|    CORSMiddleware,
+362|    allow_credentials=True,
+363|    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+364|    allow_methods=["*"],
+365|    allow_headers=["*"],
+366|)
+367|
+368|# Configure logging
+369|logging.basicConfig(
+370|    level=logging.INFO,
+371|    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+372|)
+373|logger = logging.getLogger(__name__)
+374|
+375|@app.on_event("shutdown")
+376|async def shutdown_db_client():
+377|    client.close()
+
+
+/app/frontend/src/App.js:
+1|import React, { useState, useEffect } from "react";
+2|import "./App.css";
+3|import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+4|import axios from "axios";
+5|import { Button } from "./components/ui/button";
+6|import { Card, CardHeader, CardTitle, CardContent } from "./components/ui/card";
+7|import { Badge } from "./components/ui/badge";
+8|import { Progress } from "./components/ui/progress";
+9|import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
+10|import { Alert, AlertDescription } from "./components/ui/alert";
+11|import { Input } from "./components/ui/input";
+12|import { Label } from "./components/ui/label";
+13|import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select";
+14|import { Battery, Zap, Leaf, TrendingUp, Lightbulb, Award, Settings, User, BarChart3 } from "lucide-react";
+15|
+16|const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+17|const API = `${BACKEND_URL}/api`;
+18|
+19|// Mock current user for demo
+20|const DEMO_USER = {
+21|  id: "demo-user-123",
+22|  name: "Demo User",
+23|  email: "demo@trashbattery.com",
+24|  user_type: "household"
+25|};
+26|
+27|const Onboarding = ({ onComplete }) => {
+28|  const [formData, setFormData] = useState({
+29|    name: "",
+30|    email: "",
+31|    user_type: "household"
+32|  });
+33|  const [loading, setLoading] = useState(false);
+34|
+35|  const handleSubmit = async (e) => {
+36|    e.preventDefault();
+37|    setLoading(true);
+38|    
+39|    try {
+40|      await axios.post(`${API}/users`, formData);
+41|      onComplete({...formData, id: `user-${Date.now()}`});
+42|    } catch (error) {
+43|      console.error("Error creating user:", error);
+44|    } finally {
+45|      setLoading(false);
+46|    }
+47|  };
+48|
+49|  return (
+50|    <div className="min-h-screen bg-gradient-to-br from-emerald-50 to-teal-100 flex items-center justify-center p-4">
+51|      <Card className="w-full max-w-md shadow-2xl backdrop-blur-sm bg-white/90">
+52|        <CardHeader className="text-center space-y-4">
+53|          <div className="w-16 h-16 bg-gradient-to-r from-emerald-500 to-teal-600 rounded-full flex items-center justify-center mx-auto">
+54|            <Battery className="w-8 h-8 text-white" />
+55|          </div>
+56|          <div>
+57|            <CardTitle className="text-2xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 bg-clip-text text-transparent">
+58|              Welcome to Trash Battery
+59|            </CardTitle>
+60|            <p className="text-gray-600 mt-2">Transform your food waste into clean energy</p>
+61|          </div>
+62|        </CardHeader>
+63|        <CardContent>
+64|          <form onSubmit={handleSubmit} className="space-y-4">
+65|            <div>
+66|              <Label htmlFor="name">Full Name</Label>
+67|              <Input
+68|                id="name"
+69|                value={formData.name}
+70|                onChange={(e) => setFormData({...formData, name: e.target.value})}
+71|                placeholder="Enter your name"
+72|                required
+73|              />
+74|            </div>
+75|            
+76|            <div>
+77|              <Label htmlFor="email">Email</Label>
+78|              <Input
+79|                id="email"
+80|                type="email"
+81|                value={formData.email}
+82|                onChange={(e) => setFormData({...formData, email: e.target.value})}
+83|                placeholder="Enter your email"
+84|                required
+85|              />
+86|            </div>
+87|            
+88|            <div>
+89|              <Label htmlFor="user_type">User Type</Label>
+90|              <Select value={formData.user_type} onValueChange={(value) => setFormData({...formData, user_type: value})}>
+91|                <SelectTrigger>
+92|                  <SelectValue placeholder="Select user type" />
+93|                </SelectTrigger>
+94|                <SelectContent>
+95|                  <SelectItem value="household">Household</SelectItem>
+96|                  <SelectItem value="restaurant">Restaurant</SelectItem>
+97|                  <SelectItem value="mess">Mess/Cafeteria</SelectItem>
+98|                </SelectContent>
+99|              </Select>
+100|            </div>
+101|            
+102|            <Button 
+103|              type="submit" 
+104|              className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700"
+105|              disabled={loading}
+106|            >
+107|              {loading ? "Setting up..." : "Get Started"}
+108|            </Button>
+109|          </form>
+110|        </CardContent>
+111|      </Card>
+112|    </div>
+113|  );
+114|};
+115|
+116|const Dashboard = ({ user }) => {
+117|  const [dashboardData, setDashboardData] = useState(null);
+118|  const [loading, setLoading] = useState(true);
+119|  const [selectedDevice, setSelectedDevice] = useState(null);
+120|
+121|  useEffect(() => {
+122|    fetchDashboardData();
+123|  }, []);
+124|
+125|  const fetchDashboardData = async () => {
+126|    try {
+127|      setLoading(true);
+128|      
+129|      // Create demo device if none exists
+130|      await axios.post(`${API}/devices`, {
+131|        user_id: user.id,
+132|        name: user.user_type === 'household' ? 'Kitchen TrashBattery' : 'Commercial TrashBattery Unit',
+133|        location: user.user_type === 'household' ? 'Kitchen' : 'Main Floor'
+134|      });
+135|
+136|      // Generate mock data
+137|      const devices = await axios.get(`${API}/users/${user.id}/devices`);
+138|      if (devices.data.length > 0) {
+139|        await axios.post(`${API}/devices/${devices.data[0].id}/mock-data?count=20`);
+140|      }
+141|
+142|      // Fetch dashboard data
+143|      const response = await axios.get(`${API}/users/${user.id}/dashboard`);
+144|      setDashboardData(response.data);
+145|      
+146|      if (response.data.devices && response.data.devices.length > 0) {
+147|        setSelectedDevice(response.data.devices[0]);
+148|      }
+149|    } catch (error) {
+150|      console.error("Error fetching dashboard data:", error);
+151|    } finally {
+152|      setLoading(false);
+153|    }
+154|  };
+155|
+156|  const generateMoreData = async () => {
+157|    if (selectedDevice) {
+158|      await axios.post(`${API}/devices/${selectedDevice.id}/mock-data?count=5`);
+159|      fetchDashboardData();
+160|    }
+161|  };
+162|
+163|  if (loading) {
+164|    return (
+165|      <div className="min-h-screen bg-gradient-to-br from-emerald-50 to-teal-100 flex items-center justify-center">
+166|        <div className="text-center">
+167|          <div className="w-16 h-16 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+168|          <p className="text-emerald-700 font-medium">Loading your energy dashboard...</p>
+169|        </div>
+170|      </div>
+171|    );
+172|  }
+173|
+174|  if (!dashboardData || !dashboardData.summary) {
+175|    return (
+176|      <div className="min-h-screen bg-gradient-to-br from-emerald-50 to-teal-100 flex items-center justify-center">
+177|        <div className="text-center">
+178|          <p className="text-emerald-700">No data available. Please try again.</p>
+179|          <Button onClick={fetchDashboardData} className="mt-4">Refresh</Button>
+180|        </div>
+181|      </div>
+182|    );
+183|  }
+184|
+185|  const { summary, environmental_impact, ai_insights, achievements, recent_readings } = dashboardData;
+186|
+187|  return (
+188|    <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-teal-50 to-blue-50">
+189|      {/* Header */}
+190|      <header className="bg-white/80 backdrop-blur-md border-b border-emerald-100 sticky top-0 z-50">
+191|        <div className="max-w-7xl mx-auto px-4 py-4">
+192|          <div className="flex items-center justify-between">
+193|            <div className="flex items-center space-x-3">
+194|              <div className="w-10 h-10 bg-gradient-to-r from-emerald-500 to-teal-600 rounded-lg flex items-center justify-center">
+195|                <Battery className="w-6 h-6 text-white" />
+196|              </div>
+197|              <div>
+198|                <h1 className="text-xl font-bold text-emerald-900">Trash Battery</h1>
+199|                <p className="text-sm text-emerald-600">Welcome back, {user.name}</p>
+200|              </div>
+201|            </div>
+202|            <div className="flex items-center space-x-2">
+203|              <Badge variant="secondary" className="bg-emerald-100 text-emerald-700">
+204|                {user.user_type.charAt(0).toUpperCase() + user.user_type.slice(1)}
+205|              </Badge>
+206|              <Button variant="ghost" size="sm">
+207|                <Settings className="w-4 h-4" />
+208|              </Button>
+209|            </div>
+210|          </div>
+211|        </div>
+212|      </header>
+213|
+214|      <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+215|        {/* Hero Stats */}
+216|        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+217|          <Card className="bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-xl">
+218|            <CardContent className="p-6">
+219|              <div className="flex items-center justify-between">
+220|                <div>
+221|                  <p className="text-emerald-100 text-sm">Energy Generated</p>
+222|                  <p className="text-2xl font-bold">{summary.total_energy_generated} Wh</p>
+223|                </div>
+224|                <Zap className="w-8 h-8 text-emerald-200" />
+225|              </div>
+226|            </CardContent>
+227|          </Card>
+228|
+229|          <Card className="bg-gradient-to-br from-orange-500 to-red-500 text-white shadow-xl">
+230|            <CardContent className="p-6">
+231|              <div className="flex items-center justify-between">
+232|                <div>
+233|                  <p className="text-orange-100 text-sm">Food Waste Processed</p>
+234|                  <p className="text-2xl font-bold">{summary.total_food_waste} kg</p>
+235|                </div>
+236|                <Leaf className="w-8 h-8 text-orange-200" />
+237|              </div>
+238|            </CardContent>
+239|          </Card>
+240|
+241|          <Card className="bg-gradient-to-br from-blue-500 to-indigo-600 text-white shadow-xl">
+242|            <CardContent className="p-6">
+243|              <div className="flex items-center justify-between">
+244|                <div>
+245|                  <p className="text-blue-100 text-sm">Conversion Efficiency</p>
+246|                  <p className="text-2xl font-bold">{summary.average_efficiency}%</p>
+247|                </div>
+248|                <TrendingUp className="w-8 h-8 text-blue-200" />
+249|              </div>
+250|            </CardContent>
+251|          </Card>
+252|
+253|          <Card className="bg-gradient-to-br from-purple-500 to-pink-500 text-white shadow-xl">
+254|            <CardContent className="p-6">
+255|              <div className="flex items-center justify-between">
+256|                <div>
+257|                  <p className="text-purple-100 text-sm">CO₂ Saved</p>
+258|                  <p className="text-2xl font-bold">{environmental_impact.co2_saved_kg} kg</p>
+259|                </div>
+260|                <Leaf className="w-8 h-8 text-purple-200" />
+261|              </div>
+262|            </CardContent>
+263|          </Card>
+264|        </div>
+265|
+266|        {/* Environmental Impact */}
+267|        <Card className="shadow-xl bg-gradient-to-r from-green-400 to-emerald-500 text-white">
+268|          <CardHeader>
+269|            <CardTitle className="flex items-center space-x-2">
+270|              <Leaf className="w-5 h-5" />
+271|              <span>Environmental Impact</span>
+272|            </CardTitle>
+273|          </CardHeader>
+274|          <CardContent>
+275|            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+276|              <div className="text-center">
+277|                <p className="text-3xl font-bold">{environmental_impact.co2_saved_kg} kg</p>
+278|                <p className="text-green-100">CO₂ Saved</p>
+279|              </div>
+280|              <div className="text-center">
+281|                <p className="text-3xl font-bold">{environmental_impact.trees_equivalent_days}</p>
+282|                <p className="text-green-100">Tree Days Equivalent</p>
+283|              </div>
+284|              <div className="text-center">
+285|                <p className="text-3xl font-bold">{environmental_impact.grid_energy_offset_wh} Wh</p>
+286|                <p className="text-green-100">Grid Energy Offset</p>
+287|              </div>
+288|            </div>
+289|          </CardContent>
+290|        </Card>
+291|
+292|        {/* Main Content Tabs */}
+293|        <Tabs defaultValue="overview" className="space-y-4">
+294|          <TabsList className="grid w-full grid-cols-4 lg:w-fit">
+295|            <TabsTrigger value="overview">Overview</TabsTrigger>
+296|            <TabsTrigger value="insights">AI Insights</TabsTrigger>
+297|            <TabsTrigger value="achievements">Achievements</TabsTrigger>
+298|            <TabsTrigger value="devices">Devices</TabsTrigger>
+299|          </TabsList>
+300|
+301|          <TabsContent value="overview" className="space-y-4">
+302|            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+303|              {/* Recent Activity */}
+304|              <Card className="shadow-lg">
+305|                <CardHeader>
+306|                  <CardTitle className="flex items-center space-x-2">
+307|                    <BarChart3 className="w-5 h-5 text-emerald-600" />
+308|                    <span>Recent Activity</span>
+309|                  </CardTitle>
+310|                </CardHeader>
+311|                <CardContent>
+312|                  <div className="space-y-3">
+313|                    {recent_readings.slice(0, 5).map((reading, index) => (
+314|                      <div key={index} className="flex items-center justify-between p-3 bg-emerald-50 rounded-lg">
+315|                        <div>
+316|                          <p className="font-medium text-emerald-900">{reading.food_weight} kg processed</p>
+317|                          <p className="text-sm text-emerald-600">Generated {reading.energy_generated} Wh</p>
+318|                        </div>
+319|                        <Badge variant="secondary" className="bg-emerald-100 text-emerald-700">
+320|                          {reading.conversion_efficiency}% efficiency
+321|                        </Badge>
+322|                      </div>
+323|                    ))}
+324|                  </div>
+325|                  <Button onClick={generateMoreData} variant="outline" className="w-full mt-4">
+326|                    Generate New Data
+327|                  </Button>
+328|                </CardContent>
+329|              </Card>
+330|
+331|              {/* Battery Status */}
+332|              <Card className="shadow-lg">
+333|                <CardHeader>
+334|                  <CardTitle className="flex items-center space-x-2">
+335|                    <Battery className="w-5 h-5 text-emerald-600" />
+336|                    <span>Battery Status</span>
+337|                  </CardTitle>
+338|                </CardHeader>
+339|                <CardContent>
+340|                  {recent_readings.length > 0 && (
+341|                    <div className="space-y-4">
+342|                      <div>
+343|                        <div className="flex justify-between mb-2">
+344|                          <span className="text-sm font-medium">Battery Level</span>
+345|                          <span className="text-sm text-emerald-600">{Math.round(recent_readings[0].battery_level)}%</span>
+346|                        </div>
+347|                        <Progress value={recent_readings[0].battery_level} className="h-3" />
+348|                      </div>
+349|                      
+350|                      <div className="grid grid-cols-2 gap-4">
+351|                        <div className="bg-blue-50 p-3 rounded-lg">
+352|                          <p className="text-sm text-blue-600">Temperature</p>
+353|                          <p className="text-lg font-bold text-blue-900">{recent_readings[0].temperature}°C</p>
+354|                        </div>
+355|                        <div className="bg-green-50 p-3 rounded-lg">
+356|                          <p className="text-sm text-green-600">pH Level</p>
+357|                          <p className="text-lg font-bold text-green-900">{recent_readings[0].ph_level}</p>
+358|                        </div>
+359|                      </div>
+360|                    </div>
+361|                  )}
+362|                </CardContent>
+363|              </Card>
+364|            </div>
+365|          </TabsContent>
+366|
+367|          <TabsContent value="insights" className="space-y-4">
+368|            <Card className="shadow-lg">
+369|              <CardHeader>
+370|                <CardTitle className="flex items-center space-x-2">
+371|                  <Lightbulb className="w-5 h-5 text-amber-600" />
+372|                  <span>AI-Powered Insights</span>
+373|                </CardTitle>
+374|              </CardHeader>
+375|              <CardContent>
+376|                <div className="space-y-4">
+377|                  {ai_insights && ai_insights.length > 0 ? (
+378|                    ai_insights.map((insight, index) => (
+379|                      <Alert key={index} className="border-l-4 border-l-amber-500">
+380|                        <Lightbulb className="w-4 h-4" />
+381|                        <AlertDescription className="font-medium">
+382|                          {insight.content}
+383|                        </AlertDescription>
+384|                      </Alert>
+385|                    ))
+386|                  ) : (
+387|                    <Alert>
+388|                      <Lightbulb className="w-4 h-4" />
+389|                      <AlertDescription>
+390|                        AI insights will appear here as you generate more data. Keep using your Trash Battery to get personalized recommendations!
+391|                      </AlertDescription>
+392|                    </Alert>
+393|                  )}
+394|                </div>
+395|              </CardContent>
+396|            </Card>
+397|          </TabsContent>
+398|
+399|          <TabsContent value="achievements" className="space-y-4">
+400|            <Card className="shadow-lg">
+401|              <CardHeader>
+402|                <CardTitle className="flex items-center space-x-2">
+403|                  <Award className="w-5 h-5 text-yellow-600" />
+404|                  <span>Achievements</span>
+405|                </CardTitle>
+406|              </CardHeader>
+407|              <CardContent>
+408|                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+409|                  {achievements && achievements.length > 0 ? (
+410|                    achievements.map((achievement, index) => (
+411|                      <div key={index} className="bg-gradient-to-r from-yellow-50 to-amber-50 p-4 rounded-lg border border-yellow-200">
+412|                        <div className="flex items-center space-x-3">
+413|                          <div className="text-2xl">{achievement.icon}</div>
+414|                          <div>
+415|                            <h3 className="font-bold text-yellow-900">{achievement.title}</h3>
+416|                            <p className="text-sm text-yellow-700">{achievement.description}</p>
+417|                            <Badge className="mt-1 bg-yellow-200 text-yellow-800">
+418|                              {achievement.points} points
+419|                            </Badge>
+420|                          </div>
+421|                        </div>
+422|                      </div>
+423|                    ))
+424|                  ) : (
+425|                    <div className="col-span-2 text-center py-8">
+426|                      <Award className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+427|                      <p className="text-gray-500">Keep using your Trash Battery to unlock achievements!</p>
+428|                    </div>
+429|                  )}
+430|                </div>
+431|              </CardContent>
+432|            </Card>
+433|          </TabsContent>
+434|
+435|          <TabsContent value="devices" className="space-y-4">
+436|            <Card className="shadow-lg">
+437|              <CardHeader>
+438|                <CardTitle className="flex items-center space-x-2">
+439|                  <Settings className="w-5 h-5 text-gray-600" />
+440|                  <span>Your Devices</span>
+441|                </CardTitle>
+442|              </CardHeader>
+443|              <CardContent>
+444|                <div className="space-y-4">
+445|                  {dashboardData.devices && dashboardData.devices.length > 0 ? (
+446|                    dashboardData.devices.map((device, index) => (
+447|                      <div key={index} className="bg-gray-50 p-4 rounded-lg border">
+448|                        <div className="flex items-center justify-between">
+449|                          <div>
+450|                            <h3 className="font-bold text-gray-900">{device.name}</h3>
+451|                            <p className="text-sm text-gray-600">{device.location}</p>
+452|                          </div>
+453|                          <Badge variant={device.status === 'active' ? 'default' : 'secondary'}>
+454|                            {device.status}
+455|                          </Badge>
+456|                        </div>
+457|                      </div>
+458|                    ))
+459|                  ) : (
+460|                    <p className="text-gray-500 text-center py-8">No devices found</p>
+461|                  )}
+462|                </div>
+463|              </CardContent>
+464|            </Card>
+465|          </TabsContent>
+466|        </Tabs>
+467|      </div>
+468|    </div>
+469|  );
+470|};
+471|
+472|function App() {
+473|  const [user, setUser] = useState(DEMO_USER); // Using demo user for quick start
+474|  const [showOnboarding, setShowOnboarding] = useState(false);
+475|
+476|  const handleOnboardingComplete = (userData) => {
+477|    setUser(userData);
+478|    setShowOnboarding(false);
+479|  };
+480|
+481|  return (
+482|    <div className="App">
+483|      <BrowserRouter>
+484|        <Routes>
+485|          <Route path="/" element={
+486|            user ? (
+487|              <Dashboard user={user} />
+488|            ) : (
+489|              <Onboarding onComplete={handleOnboardingComplete} />
+490|            )
+491|          } />
+492|        </Routes>
+493|      </BrowserRouter>
+494|    </div>
+495|  );
+496|}
+497|
+498|export default App;
+
+
+/app/frontend/src/App.css:
+1|@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+2|
+3|* {
+4|  margin: 0;
+5|  padding: 0;
+6|  box-sizing: border-box;
+7|}
+8|
+9|body {
+10|  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+11|    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+12|    sans-serif;
+13|  -webkit-font-smoothing: antialiased;
+14|  -moz-osx-font-smoothing: grayscale;
+15|  background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 50%, #f0f9ff 100%);
+16|  min-height: 100vh;
+17|}
+18|
+19|.App {
+20|  min-height: 100vh;
+21|}
+22|
+23|/* Custom scrollbar */
+24|::-webkit-scrollbar {
+25|  width: 8px;
+26|}
+27|
+28|::-webkit-scrollbar-track {
+29|  background: #f1f5f9;
+30|}
+31|
+32|::-webkit-scrollbar-thumb {
+33|  background: #cbd5e1;
+34|  border-radius: 4px;
+35|}
+36|
+37|::-webkit-scrollbar-thumb:hover {
+38|  background: #94a3b8;
+39|}
+40|
+41|/* Smooth transitions for interactive elements */
+42|button, .card, .badge {
+43|  transition: all 0.2s ease-in-out;
+44|}
+45|
+46|/* Enhanced hover effects */
+47|.card:hover {
+48|  transform: translateY(-2px);
+49|  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+50|}
+51|
+52|/* Glass morphism effect for cards */
+53|.glass-card {
+54|  background: rgba(255, 255, 255, 0.25);
+55|  backdrop-filter: blur(10px);
+56|  border: 1px solid rgba(255, 255, 255, 0.18);
+57|}
+58|
+59|/* Custom gradient text */
+60|.gradient-text {
+61|  background: linear-gradient(135deg, #059669 0%, #0891b2 100%);
+62|  -webkit-background-clip: text;
+63|  -webkit-text-fill-color: transparent;
+64|  background-clip: text;
+65|}
+66|
+67|/* Loading spinner */
+68|.spinner {
+69|  animation: spin 1s linear infinite;
+70|}
+71|
+72|@keyframes spin {
+73|  from {
+74|    transform: rotate(0deg);
+75|  }
+76|  to {
+77|    transform: rotate(360deg);
+78|  }
+79|}
+80|
+81|/* Pulse animation for energy indicators */
+82|.pulse-green {
+83|  animation: pulse-green 2s infinite;
+84|}
+85|
+86|@keyframes pulse-green {
+87|  0%, 100% {
+88|    opacity: 1;
+89|  }
+90|  50% {
+91|    opacity: 0.7;
+92|  }
+93|}
+94|
+95|/* Custom focus states */
+96|button:focus-visible,
+97|input:focus-visible,
+98|select:focus-visible {
+99|  outline: 2px solid #059669;
+100|  outline-offset: 2px;
+101|}
+102|
+103|/* Responsive typography */
+104|@media (max-width: 768px) {
+105|  body {
+106|    font-size: 14px;
+107|  }
+108|  
+109|  h1 {
+110|    font-size: 1.5rem;
+111|  }
+112|  
+113|  h2 {
+114|    font-size: 1.25rem;
+115|  }
+116|}
+117|
+118|/* Dark mode support */
+119|@media (prefers-color-scheme: dark) {
+120|  :root {
+121|    --background: #0f172a;
+122|    --foreground: #f8fafc;
+123|  }
+124|}
+125|
+126|/* Animations for achievements */
+127|.achievement-unlock {
+128|  animation: achievement-bounce 0.6s ease-out;
+129|}
+130|
+131|@keyframes achievement-bounce {
+132|  0% {
+133|    transform: scale(0.3);
+134|    opacity: 0;
+135|  }
+136|  50% {
+137|    transform: scale(1.05);
+138|  }
+139|  70% {
+140|    transform: scale(0.9);
+141|  }
+142|  100% {
+143|    transform: scale(1);
+144|    opacity: 1;
+145|  }
+146|}
+147|
+148|/* Energy flow animation */
+149|.energy-flow {
+150|  position: relative;
+151|  overflow: hidden;
+152|}
+153|
+154|.energy-flow::before {
+155|  content: '';
+156|  position: absolute;
+157|  top: 0;
+158|  left: -100%;
+159|  width: 100%;
+160|  height: 100%;
+161|  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+162|  animation: flow 2s infinite;
+163|}
+164|
+165|@keyframes flow {
+166|  0% {
+167|    left: -100%;
+168|  }
+169|  100% {
+170|    left: 100%;
+171|  }
+172|}
+173|
+174|/* Utility classes */
+175|.text-shadow {
+176|  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+177|}
+178|
+179|.blur-backdrop {
+180|  backdrop-filter: blur(12px);
+181|}
+182|
+183|/* Custom scrollbar for cards */
+184|.card-scroll::-webkit-scrollbar {
+185|  width: 4px;
+186|}
+187|
+188|.card-scroll::-webkit-scrollbar-thumb {
+189|  background: rgba(0, 0, 0, 0.2);
+190|  border-radius: 2px;
+191|}
+
+
+/app/backend/.env:
+1|MONGO_URL="mongodb://localhost:27017"
+2|DB_NAME="test_database"
+3|CORS_ORIGINS="*"
+4|EMERGENT_LLM_KEY=sk-emergent-25a5dE2A97b4165B89
+
+
+/app/frontend/.env:
+1|REACT_APP_BACKEND_URL=https://foodenergy.preview.emergentagent.com
+2|WDS_SOCKET_PORT=443
+
+
+/app/backend/requirements.txt:
+1|aiohappyeyeballs==2.6.1
+2|aiohttp==3.12.15
+3|aiosignal==1.4.0
+4|annotated-types==0.7.0
+5|anyio==4.10.0
+6|attrs==25.3.0
+7|black==25.9.0
+8|boto3==1.40.35
+9|botocore==1.40.35
+10|cachetools==5.5.2
+11|certifi==2025.8.3
+12|cffi==2.0.0
+13|charset-normalizer==3.4.3
+14|click==8.3.0
+15|cryptography==46.0.1
+16|distro==1.9.0
+17|dnspython==2.8.0
+18|ecdsa==0.19.1
+19|email-validator==2.3.0
+20|emergentintegrations==0.1.0
+21|fastapi==0.110.1
+22|fastuuid==0.12.0
+23|filelock==3.19.1
+24|flake8==7.3.0
+25|frozenlist==1.7.0
+26|fsspec==2025.9.0
+27|google-ai-generativelanguage==0.6.15
+28|google-api-core==2.25.1
+29|google-api-python-client==2.182.0
+30|google-auth==2.40.3
+31|google-auth-httplib2==0.2.0
+32|google-genai==1.38.0
+33|google-generativeai==0.8.5
+34|googleapis-common-protos==1.70.0
+35|grpcio==1.75.0
+36|grpcio-status==1.71.2
+37|h11==0.16.0
+38|hf-xet==1.1.10
+39|httpcore==1.0.9
+40|httplib2==0.31.0
+41|httpx==0.28.1
+42|huggingface-hub==0.35.0
+43|idna==3.10
+44|importlib_metadata==8.7.0
+45|iniconfig==2.1.0
+46|isort==6.0.1
+47|Jinja2==3.1.6
+48|jiter==0.11.0
+49|jmespath==1.0.1
+50|jq==1.10.0
+51|jsonschema==4.25.1
+52|jsonschema-specifications==2025.9.1
+53|litellm==1.77.2.post1
+54|markdown-it-py==4.0.0
+55|MarkupSafe==3.0.2
+56|mccabe==0.7.0
+57|mdurl==0.1.2
+58|motor==3.3.1
+59|multidict==6.6.4
+60|mypy==1.18.2
+61|mypy_extensions==1.1.0
+62|numpy==2.3.3
+63|oauthlib==3.3.1
+64|openai==1.99.9
+65|packaging==25.0
+66|pandas==2.3.2
+67|passlib==1.7.4
+68|pathspec==0.12.1
+69|pillow==11.3.0
+70|platformdirs==4.4.0
+71|pluggy==1.6.0
+72|propcache==0.3.2
+73|proto-plus==1.26.1
+74|protobuf==5.29.5
+75|pyasn1==0.6.1
+76|pyasn1_modules==0.4.2
+77|pycodestyle==2.14.0
+78|pycparser==2.23
+79|pydantic==2.11.9
+80|pydantic_core==2.33.2
+81|pyflakes==3.4.0
+82|Pygments==2.19.2
+83|PyJWT==2.10.1
+84|pymongo==4.5.0
+85|pyparsing==3.2.4
+86|pytest==8.4.2
+87|python-dateutil==2.9.0.post0
+88|python-dotenv==1.1.1
+89|python-jose==3.5.0
+90|python-multipart==0.0.20
+91|pytokens==0.1.10
+92|pytz==2025.2
+93|PyYAML==6.0.2
+94|referencing==0.36.2
+95|regex==2025.9.18
+96|requests==2.32.5
+97|requests-oauthlib==2.0.0
+98|rich==14.1.0
+99|rpds-py==0.27.1
+100|rsa==4.9.1
+101|s3transfer==0.14.0
+102|s5cmd==0.2.0
+103|shellingham==1.5.4
+104|six==1.17.0
+105|sniffio==1.3.1
+106|starlette==0.37.2
+107|stripe==12.5.1
+108|tenacity==9.1.2
+109|tiktoken==0.11.0
+110|tokenizers==0.22.1
+111|tqdm==4.67.1
+112|typer==0.18.0
+113|typing-inspection==0.4.1
+114|typing_extensions==4.15.0
+115|tzdata==2025.2
+116|uritemplate==4.2.0
+117|urllib3==2.5.0
+118|uvicorn==0.25.0
+119|watchfiles==1.1.0
+120|websockets==15.0.1
+121|yarl==1.20.1
+122|zipp==3.23.0
+123|
+
+
+/app/frontend/package.json:
+1|{
+2|  "name": "frontend",
+3|  "version": "0.1.0",
+4|  "private": true,
+5|  "dependencies": {
+6|    "@hookform/resolvers": "^5.0.1",
+7|    "@radix-ui/react-accordion": "^1.2.8",
+8|    "@radix-ui/react-alert-dialog": "^1.1.11",
+9|    "@radix-ui/react-aspect-ratio": "^1.1.4",
+10|    "@radix-ui/react-avatar": "^1.1.7",
+11|    "@radix-ui/react-checkbox": "^1.2.3",
+12|    "@radix-ui/react-collapsible": "^1.1.8",
+13|    "@radix-ui/react-context-menu": "^2.2.12",
+14|    "@radix-ui/react-dialog": "^1.1.11",
+15|    "@radix-ui/react-dropdown-menu": "^2.1.12",
+16|    "@radix-ui/react-hover-card": "^1.1.11",
+17|    "@radix-ui/react-label": "^2.1.4",
+18|    "@radix-ui/react-menubar": "^1.1.12",
+19|    "@radix-ui/react-navigation-menu": "^1.2.10",
+20|    "@radix-ui/react-popover": "^1.1.11",
+21|    "@radix-ui/react-progress": "^1.1.4",
+22|    "@radix-ui/react-radio-group": "^1.3.4",
+23|    "@radix-ui/react-scroll-area": "^1.2.6",
+24|    "@radix-ui/react-select": "^2.2.2",
+25|    "@radix-ui/react-separator": "^1.1.4",
+26|    "@radix-ui/react-slider": "^1.3.2",
+27|    "@radix-ui/react-slot": "^1.2.0",
+28|    "@radix-ui/react-switch": "^1.2.2",
+29|    "@radix-ui/react-tabs": "^1.1.9",
+30|    "@radix-ui/react-toast": "^1.2.11",
+31|    "@radix-ui/react-toggle": "^1.1.6",
+32|    "@radix-ui/react-toggle-group": "^1.1.7",
+33|    "@radix-ui/react-tooltip": "^1.2.4",
+34|    "axios": "^1.8.4",
+35|    "class-variance-authority": "^0.7.1",
+36|    "clsx": "^2.1.1",
+37|    "cmdk": "^1.1.1",
+38|    "cra-template": "1.2.0",
+39|    "date-fns": "^4.1.0",
+40|    "embla-carousel-react": "^8.6.0",
+41|    "input-otp": "^1.4.2",
+42|    "lucide-react": "^0.507.0",
+43|    "next-themes": "^0.4.6",
+44|    "react": "^19.0.0",
+45|    "react-day-picker": "8.10.1",
+46|    "react-dom": "^19.0.0",
+47|    "react-hook-form": "^7.56.2",
+48|    "react-resizable-panels": "^3.0.1",
+49|    "react-router-dom": "^7.5.1",
+50|    "react-scripts": "5.0.1",
+51|    "sonner": "^2.0.3",
+52|    "tailwind-merge": "^3.2.0",
+53|    "tailwindcss-animate": "^1.0.7",
+54|    "vaul": "^1.1.2",
+55|    "zod": "^3.24.4"
+56|  },
+57|  "scripts": {
+58|    "start": "craco start",
+59|    "build": "craco build",
+60|    "test": "craco test"
+61|  },
+62|  "browserslist": {
+63|    "production": [
+64|      ">0.2%",
+65|      "not dead",
+66|      "not op_mini all"
+67|    ],
+68|    "development": [
+69|      "last 1 chrome version",
+70|      "last 1 firefox version",
+71|      "last 1 safari version"
+72|    ]
+73|  },
+74|  "devDependencies": {
+75|    "@craco/craco": "^7.1.0",
+76|    "@eslint/js": "9.23.0",
+77|    "autoprefixer": "^10.4.20",
+78|    "eslint": "9.23.0",
+79|    "eslint-plugin-import": "2.31.0",
+80|    "eslint-plugin-jsx-a11y": "6.10.2",
+81|    "eslint-plugin-react": "7.37.4",
+82|    "globals": "15.15.0",
+83|    "postcss": "^8.4.49",
+84|    "tailwindcss": "^3.4.17"
+85|  },
+86|  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+87|}
+88|
+
+
